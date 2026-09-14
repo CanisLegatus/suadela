@@ -279,6 +279,7 @@ textarea{min-height:92px;resize:vertical;font-family:ui-monospace,SFMono-Regular
   <div class="tabs">
     <button class="tab-btn active" data-action="switch-tab" data-tab="overview">Обзор</button>
     <button class="tab-btn" data-action="switch-tab" data-tab="team">Персонал</button>
+    <button class="tab-btn" data-action="switch-tab" data-tab="dayday">Day-day анализ</button>
   </div>
 </div>
 
@@ -341,6 +342,60 @@ textarea{min-height:92px;resize:vertical;font-family:ui-monospace,SFMono-Regular
       <div class="card">
         <div class="section-title"><h3>Разрез по товарным позициям</h3><span class="chip chip-success">личный вклад</span></div>
         <div id="sellerSkuBreakdown"></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-dayday" class="tab-panel" hidden>
+    <div class="kpi-grid" id="daydayKpis"></div>
+    
+    <div class="grid grid-2">
+      <div class="card">
+        <div class="section-title"><h3>Продажи по дням (общий)</h3><span class="chip chip-primary">штуки</span></div>
+        <div class="chart-box"><canvas id="ddDailyChart"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="section-title"><h3>Накопительный итог по дням</h3><span class="chip chip-success">план vs факт</span></div>
+        <div class="chart-box"><canvas id="ddCumulativeChart"></canvas></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-title">
+        <h3>Анализ по кассирам</h3>
+        <span class="chip chip-info">клик по графику — детали</span>
+      </div>
+      <div class="chart-box" style="height:400px"><canvas id="ddSellerHeatmapChart"></canvas></div>
+      <div class="note" style="margin-top:10px">Тепловая карта показывает вклад каждого кассира по дням. Чем ярче цвет, тем выше продажи.</div>
+    </div>
+
+    <div class="grid grid-2">
+      <div class="card">
+        <div class="section-title"><h3>Динамика по SKU</h3><span class="chip chip-warning">товарные позиции</span></div>
+        <div class="chart-box" style="height:350px"><canvas id="ddSkuChart"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="section-title"><h3>Структура продаж по дням</h3><span class="chip chip-neutral">доля SKU</span></div>
+        <div class="chart-box" style="height:350px"><canvas id="ddStackedChart"></canvas></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-title">
+        <h3>Детальный разбор по дню</h3>
+        <select id="ddDaySelect" class="input" style="width:auto;display:inline-block;min-width:180px"></select>
+      </div>
+      <div id="ddDayDetail"></div>
+    </div>
+
+    <div class="grid grid-2">
+      <div class="card">
+        <div class="section-title"><h3>Рейтинг кассиров за период</h3><span class="chip chip-primary">топ performers</span></div>
+        <div class="chart-box" style="height:400px"><canvas id="ddSellerRankingChart"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="section-title"><h3>Проникновение по дням</h3><span class="chip chip-success">чеки и штуки</span></div>
+        <div class="chart-box"><canvas id="ddPenetrationChart"></canvas></div>
       </div>
     </div>
   </section>
@@ -413,6 +468,7 @@ const STATE_VERSION = 2;
 const STORE_KEY = '__STORE__';
 const UNKNOWN_KEY = '__UNKNOWN__';
 const SKU_COLORS = ['#4f46e5','#06b6d4','#f59e0b','#10b981','#ec4899','#8b5cf6','#0ea5e9','#f97316'];
+const SELLER_COLORS = ['#4f46e5','#06b6d4','#f59e0b','#10b981','#ec4899','#8b5cf6','#0ea5e9','#f97316','#84cc16','#f43f5e','#14b8a6','#a855f7','#fbbf24','#64748b'];
 const MONTH_NAMES = ['Январь','Февраль','Март','Апрель','Май','Июнь','Июль','Август','Сентябрь','Октябрь','Ноябрь','Декабрь'];
 const MONTH_STEMS = ['янв','фев','мар','апр','ма','июн','июл','авг','сен','окт','ноя','дек'];
 const LATIN_TO_CYR = {a:'а',b:'в',c:'с',e:'е',h:'н',k:'к',m:'м',o:'о',p:'р',t:'т',x:'х',y:'у'};
@@ -1262,7 +1318,8 @@ function renderAll(){
   renderAlerts(m);
   renderTabs();
   if (currentTab === 'overview') renderOverview(m);
-  else renderTeam(m);
+  else if (currentTab === 'team') renderTeam(m);
+  else if (currentTab === 'dayday') renderDayDay(m);
 }
 
 function renderTabs(){
@@ -1271,6 +1328,7 @@ function renderTabs(){
   });
   document.getElementById('tab-overview').hidden = currentTab !== 'overview';
   document.getElementById('tab-team').hidden = currentTab !== 'team';
+  document.getElementById('tab-dayday').hidden = currentTab !== 'dayday';
 }
 
 function renderHeader(m){
@@ -1725,6 +1783,424 @@ function renderSellerChart(m, seller){
       }
     }
   });
+}
+
+/* ============================= DAY-DAY ANALYSIS ============================= */
+
+function renderDayDay(m){
+  renderDayDayKpis(m);
+  renderDayDayCharts(m);
+  renderDayDayDetail(m);
+}
+
+function renderDayDayKpis(m){
+  const t = m.totals;
+  const bestDay = m.dailySeries.reduce((best, d) => d.unitsOrZero > (best?.unitsOrZero || 0) ? d : best, null);
+  const worstDay = m.dailySeries.filter(d => d.imported).reduce((worst, d) => !worst || d.unitsOrZero < worst.unitsOrZero ? d : worst, null);
+  const avgDaily = m.elapsedDays > 0 ? round2(t.units / m.elapsedDays) : 0;
+  const daysWithSales = m.dailySeries.filter(d => d.unitsOrZero > 0).length;
+  const completionRate = m.totalDays > 0 ? round2(m.elapsedDays / m.totalDays * 100) : 0;
+  
+  document.getElementById('daydayKpis').innerHTML = [
+    kpiCard('📊', 'Средний чек дней', fmtNum(avgDaily) + ' шт', `Продано ${fmtNum(t.units)} шт за ${m.elapsedDays} дн.`, null, 'primary'),
+    kpiCard('🔥', 'Лучший день', bestDay ? formatShortDate(bestDay.date) + ' • ' + fmtNum(bestDay.unitsOrZero) + ' шт' : '—', bestDay ? `Накопительный: ${fmtNum(bestDay.cumulative)}` : 'Нет данных', null, 'success'),
+    kpiCard('📉', 'Слабый день', worstDay ? formatShortDate(worstDay.date) + ' • ' + fmtNum(worstDay.unitsOrZero) + ' шт' : '—', worstDay ? 'Требует анализа' : 'Нет данных', null, 'warning'),
+    kpiCard('🎯', 'Дней с продажами', String(daysWithSales), `Всего дней в периоде: ${m.totalDays} • Завершено: ${completionRate}%`, m.totalDays > 0 ? daysWithSales / m.totalDays * 100 : 0, 'info'),
+    kpiCard('⏱️', 'Прогресс периода', completionRate + '%', `Прошло ${m.elapsedDays} из ${m.totalDays} дней`, completionRate, 'neutral')
+  ].join('');
+}
+
+function renderDayDayCharts(m){
+  if (typeof Chart === 'undefined') return;
+  
+  const labels = m.dailySeries.map(d => formatShortDate(d.date));
+  
+  // Daily sales chart
+  destroyChart('ddDaily');
+  const ctx1 = document.getElementById('ddDailyChart');
+  if (ctx1) {
+    const data = m.dailySeries.map(d => d.imported ? d.unitsOrZero : (d.future ? null : 0));
+    const colors = m.dailySeries.map(d => {
+      if (!d.imported) return d.future ? 'rgba(148,163,184,.08)' : 'rgba(239,68,68,.18)';
+      if (d.unitsOrZero === 0) return 'rgba(148,163,184,.25)';
+      const intensity = Math.min(1, 0.5 + (d.unitsOrZero / (m.maxDailySellerUnits * 2 || 1)) * 0.5);
+      return `rgba(79,70,229,${intensity})`;
+    });
+    charts.ddDaily = new Chart(ctx1, {
+      type: 'bar',
+      data: {
+        labels,
+        datasets: [{
+          label: 'Продано шт',
+          data,
+          backgroundColor: colors,
+          borderRadius: 8,
+          maxBarThickness: 30
+        }, {
+          type: 'line',
+          label: 'Нужно в день',
+          data: m.dailySeries.map(() => m.totals.perDayToPlan),
+          borderColor: '#10b981',
+          borderDash: [5, 5],
+          pointRadius: 0,
+          borderWidth: 2
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { position: 'bottom' },
+          tooltip: {
+            callbacks: {
+              label: ctx => ctx.dataset.label + ': ' + (ctx.raw !== null ? fmtNum(ctx.raw) : 'нет данных')
+            }
+          }
+        },
+        scales: {
+          y: { beginAtZero: true, grid: { color: '#f1f5f9' }, title: { display: true, text: 'Штуки' } },
+          x: { grid: { display: false } }
+        }
+      }
+    });
+  }
+  
+  // Cumulative chart
+  destroyChart('ddCumulative');
+  const ctx2 = document.getElementById('ddCumulativeChart');
+  if (ctx2) {
+    charts.ddCumulative = new Chart(ctx2, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [
+          {
+            label: 'Факт',
+            data: m.dailySeries.map(d => d.imported ? d.cumulative : null),
+            borderColor: '#4f46e5',
+            backgroundColor: 'rgba(79,70,229,.10)',
+            fill: true,
+            tension: .35,
+            pointRadius: 3,
+            borderWidth: 3,
+            spanGaps: false
+          },
+          {
+            label: 'План',
+            data: m.dailySeries.map(d => d.planCumulative),
+            borderColor: '#94a3b8',
+            borderDash: [6, 6],
+            pointRadius: 0,
+            borderWidth: 2,
+            fill: false,
+            tension: .2
+          }
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { position: 'bottom' },
+          tooltip: {
+            callbacks: {
+              label: ctx => ctx.dataset.label + ': ' + (ctx.raw !== null ? fmtNum(ctx.raw) : 'нет данных')
+            }
+          }
+        },
+        scales: {
+          y: { beginAtZero: true, grid: { color: '#f1f5f9' }, title: { display: true, text: 'Накопительный итог' } },
+          x: { grid: { display: false } }
+        }
+      }
+    });
+  }
+  
+  // Seller heatmap chart
+  destroyChart('ddSellerHeatmap');
+  const ctx3 = document.getElementById('ddSellerHeatmapChart');
+  if (ctx3) {
+    const sellers = m.sellers.filter(s => s.units > 0).slice(0, 15);
+    const dates = m.allDates.slice(0, 31);
+    const sellerLabels = sellers.map(s => shortName(s.name));
+    
+    const datasets = dates.map((date, idx) => ({
+      label: formatShortDate(date),
+      data: sellers.map(s => s.daily[date] || 0),
+      backgroundColor: SELLER_COLORS[idx % SELLER_COLORS.length],
+      borderWidth: 0
+    }));
+    
+    charts.ddSellerHeatmap = new Chart(ctx3, {
+      type: 'bar',
+      data: {
+        labels: sellerLabels,
+        datasets: datasets.slice(0, 14)
+      },
+      options: {
+        indexAxis: 'y',
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { position: 'top', labels: { boxWidth: 12, font: { size: 10 } } },
+          tooltip: {
+            callbacks: {
+              label: ctx => ctx.dataset.label + ': ' + fmtNum(ctx.raw || 0) + ' шт'
+            }
+          }
+        },
+        scales: {
+          x: { stacked: true, beginAtZero: true, grid: { color: '#f1f5f9' } },
+          y: { stacked: true, grid: { display: false } }
+        }
+      }
+    });
+  }
+  
+  // SKU dynamics chart
+  destroyChart('ddSku');
+  const ctx4 = document.getElementById('ddSkuChart');
+  if (ctx4) {
+    const skuList = m.skuMetrics.filter(s => s.units > 0);
+    const datasets = skuList.map((sku, idx) => ({
+      label: sku.name,
+      data: m.dailySeries.map(d => {
+        const dayData = m.byDate[d.date] || 0;
+        return dayData > 0 ? round2((sku.units / m.totals.units) * dayData) : 0;
+      }),
+      backgroundColor: sku.color,
+      borderColor: sku.color,
+      borderWidth: 1,
+      tension: .3,
+      pointRadius: 2
+    }));
+    
+    charts.ddSku = new Chart(ctx4, {
+      type: 'line',
+      data: { labels, datasets },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { position: 'bottom' },
+          tooltip: {
+            mode: 'index',
+            intersect: false
+          }
+        },
+        scales: {
+          y: { beginAtZero: true, grid: { color: '#f1f5f9' }, title: { display: true, text: 'Штуки' } },
+          x: { grid: { display: false } }
+        }
+      }
+    });
+  }
+  
+  // Stacked daily chart
+  destroyChart('ddStacked');
+  const ctx5 = document.getElementById('ddStackedChart');
+  if (ctx5) {
+    const skuList = m.skuMetrics.filter(s => s.units > 0);
+    const datasets = skuList.map(sku => ({
+      label: sku.name,
+      data: m.dailySeries.map(d => {
+        const totalForDay = m.byDate[d.date] || 0;
+        if (totalForDay === 0) return 0;
+        return round2((sku.units / m.totals.units) * totalForDay);
+      }),
+      backgroundColor: sku.color,
+      borderWidth: 0
+    }));
+    
+    charts.ddStacked = new Chart(ctx5, {
+      type: 'bar',
+      data: { labels, datasets },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { position: 'bottom' },
+          tooltip: {
+            mode: 'index',
+            intersect: false
+          }
+        },
+        scales: {
+          x: { stacked: true, grid: { display: false } },
+          y: { stacked: true, beginAtZero: true, grid: { color: '#f1f5f9' } }
+        }
+      }
+    });
+  }
+  
+  // Seller ranking chart
+  destroyChart('ddSellerRanking');
+  const ctx6 = document.getElementById('ddSellerRankingChart');
+  if (ctx6) {
+    const topSellers = m.sellers.filter(s => s.units > 0).slice(0, 12);
+    charts.ddSellerRanking = new Chart(ctx6, {
+      type: 'bar',
+      data: {
+        labels: topSellers.map(s => shortName(s.name)),
+        datasets: [{
+          label: 'Продано шт',
+          data: topSellers.map(s => s.units),
+          backgroundColor: topSellers.map((s, i) => {
+            if (i === 0) return '#fbbf24';
+            if (i === 1) return '#94a3b8';
+            if (i === 2) return '#b45309';
+            return 'rgba(79,70,229,' + (0.8 - i * 0.05) + ')';
+          }),
+          borderRadius: 8,
+          maxBarThickness: 30
+        }]
+      },
+      options: {
+        indexAxis: 'y',
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              label: ctx => fmtNum(ctx.raw) + ' шт • Вклад: ' + fmtPct(m.sellers.find(s => s.name === topSellers[ctx.dataIndex]?.name)?.share || 0)
+            }
+          }
+        },
+        scales: {
+          x: { beginAtZero: true, grid: { color: '#f1f5f9' }, title: { display: true, text: 'Штуки' } },
+          y: { grid: { display: false } }
+        }
+      }
+    });
+  }
+  
+  // Penetration chart
+  destroyChart('ddPenetration');
+  const ctx7 = document.getElementById('ddPenetrationChart');
+  if (ctx7 && m.storeChecks > 0) {
+    const penetrationData = m.dailySeries.map(d => {
+      const units = d.unitsOrZero || 0;
+      const checksForDay = (state.checks || []).filter(c => c.date === d.date).reduce((a, c) => a + (Number(c.checks) || 0), 0);
+      return checksForDay > 0 ? round2(units / checksForDay * 100) : null;
+    });
+    
+    charts.ddPenetration = new Chart(ctx7, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [{
+          label: 'Проникновение (%)',
+          data: penetrationData,
+          borderColor: '#06b6d4',
+          backgroundColor: 'rgba(6,182,212,.12)',
+          fill: true,
+          tension: .35,
+          pointRadius: 3,
+          borderWidth: 3,
+          spanGaps: false
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { position: 'bottom' },
+          tooltip: {
+            callbacks: {
+              label: ctx => (ctx.raw !== null ? fmtNum(ctx.raw, 1) + '%' : 'нет данных по чекам')
+            }
+          }
+        },
+        scales: {
+          y: { beginAtZero: true, grid: { color: '#f1f5f9' }, title: { display: true, text: 'Штук на чек' } },
+          x: { grid: { display: false } }
+        }
+      }
+    });
+  }
+}
+
+function renderDayDayDetail(m){
+  const select = document.getElementById('ddDaySelect');
+  const importedDates = m.dailySeries.filter(d => d.imported).map(d => d.date);
+  
+  if (!select.options.length) {
+    select.innerHTML = importedDates.map(d => 
+      `<option value="${d}">${formatFullDate(d)}</option>`
+    ).join('');
+  }
+  
+  const selectedDate = select.value || importedDates[0];
+  
+  select.onchange = () => {
+    renderDayDayDetail(m);
+  };
+  
+  const dayData = m.dailySeries.find(d => d.date === selectedDate);
+  if (!dayData) {
+    document.getElementById('ddDayDetail').innerHTML = '<div class="empty-state"><strong>Нет данных для выбранного дня</strong></div>';
+    return;
+  }
+  
+  const sellersByContribution = m.sellers
+    .filter(s => (s.daily[selectedDate] || 0) > 0)
+    .sort((a, b) => (b.daily[selectedDate] || 0) - (a.daily[selectedDate] || 0));
+  
+  const skuBreakdown = m.skuMetrics.map(sku => {
+    const totalForDay = m.byDate[selectedDate] || 0;
+    const skuForDay = totalForDay > 0 ? round2((sku.units / m.totals.units) * totalForDay) : 0;
+    return { ...sku, unitsForDay: skuForDay };
+  }).filter(s => s.unitsForDay > 0).sort((a, b) => b.unitsForDay - a.unitsForDay);
+  
+  document.getElementById('ddDayDetail').innerHTML = `
+    <div class="grid grid-2" style="margin-bottom:18px">
+      <div class="stat-box" style="background:linear-gradient(135deg,#eef2ff,#e0e7ff);border:none">
+        <span style="font-size:11px;color:#4338ca;font-weight:800;text-transform:uppercase">Дата</span>
+        <div style="font-size:20px;font-weight:800;color:#3730a3">${formatFullDate(selectedDate)}</div>
+      </div>
+      <div class="stat-box" style="background:linear-gradient(135deg,#ecfdf5,#d1fae5);border:none">
+        <span style="font-size:11px;color:#047857;font-weight:800;text-transform:uppercase">Продажи</span>
+        <div style="font-size:20px;font-weight:800;color:#065f46">${fmtNum(dayData.unitsOrZero)} шт</div>
+      </div>
+      <div class="stat-box" style="background:linear-gradient(135deg,#fffbeb,#fef3c7);border:none">
+        <span style="font-size:11px;color:#b45309;font-weight:800;text-transform:uppercase">Накопительный</span>
+        <div style="font-size:20px;font-weight:800;color:#92400e">${fmtNum(dayData.cumulative)} шт</div>
+      </div>
+      <div class="stat-box" style="background:linear-gradient(135deg,#eff6ff,#dbeafe);border:none">
+        <span style="font-size:11px;color:#1d4ed8;font-weight:800;text-transform:uppercase">Отставание от плана</span>
+        <div style="font-size:20px;font-weight:800;color:#1e40af">${fmtNum(dayData.planCumulative - dayData.cumulative)} шт</div>
+      </div>
+    </div>
+    
+    <h4 style="margin:16px 0 12px;font-size:16px">Топ кассиров дня</h4>
+    <div class="employee-list" style="margin-bottom:16px">
+      ${sellersByContribution.slice(0, 5).map((s, i) => `
+        <div class="employee-chip" style="padding:10px 14px;border-radius:12px;background:${i === 0 ? '#fef3c7' : '#fff'};border-color:${i === 0 ? '#fbbf24' : 'var(--border)'}">
+          <span style="font-size:16px;margin-right:6px">${i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : '👤'}</span>
+          <strong>${esc(s.name)}</strong>
+          <span style="margin-left:8px;color:var(--muted)">•</span>
+          <strong style="margin-left:8px">${fmtNum(s.daily[selectedDate])} шт</strong>
+        </div>
+      `).join('') || '<span class="muted">Нет данных</span>'}
+    </div>
+    
+    <h4 style="margin:16px 0 12px;font-size:16px">Структура продаж по SKU</h4>
+    <div class="list-box" style="max-height:220px">
+      ${skuBreakdown.map(sku => `
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid #f1f5f9">
+          <div style="display:flex;align-items:center;gap:10px">
+            <div style="width:12px;height:12px;border-radius:3px;background:${sku.color}"></div>
+            <strong>${esc(sku.name)}</strong>
+          </div>
+          <div style="text-align:right">
+            <strong>${fmtNum(sku.unitsForDay)} шт</strong>
+            <div class="muted small">${fmtPct(m.totals.units > 0 ? sku.unitsForDay / dayData.unitsOrZero * 100 : 0)}</div>
+          </div>
+        </div>
+      `).join('') || '<div class="empty-state" style="padding:16px">Нет данных</div>'}
+    </div>
+  `;
 }
 
 /* ============================= MODALS ============================= */
