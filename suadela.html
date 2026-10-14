@@ -531,6 +531,8 @@ function defaultState(){
         cashierRate: 5,
         fundRate: 5,
         threshold: 70,
+        startDate: '',
+        endDate: '',
         enabled: true
       }]
     },
@@ -565,6 +567,8 @@ function migrateState(st){
     cashierRate: Number(sku.cashierRate) || 0,
     fundRate: Number(sku.fundRate) || 0,
     threshold: Number(sku.threshold) || 0,
+    startDate: typeof sku.startDate === 'string' ? sku.startDate : '',
+    endDate: typeof sku.endDate === 'string' ? sku.endDate : '',
     enabled: sku.enabled !== false
   }));
 
@@ -610,6 +614,19 @@ function eachDate(start,end){
   return res;
 }
 function daysBetweenInclusive(start,end){ return eachDate(start,end).length; }
+/* Диапазон продаж SKU внутри месяца акции: null = весь месяц (как раньше), иначе [skuStart, skuEnd] */
+function skuSaleRange(sku, monthStart, monthEnd){
+  if (!sku) return null;
+  const s = (sku.startDate && sku.startDate > monthStart) ? sku.startDate : monthStart;
+  const e = (sku.endDate && sku.endDate < monthEnd) ? sku.endDate : monthEnd;
+  if (s === monthStart && e === monthEnd) return null;
+  if (s > e) return null;
+  return { start:s, end:e };
+}
+function isDateInSkuRange(dateISO, range){ return !range || (dateISO >= range.start && dateISO <= range.end); }
+function rangeStartIso(range, fallback){ return range ? range.start : fallback; }
+function rangeEndIso(range, fallback){ return range ? range.end : fallback; }
+function skuRangeText(range){ return range ? formatShortDate(range.start) + ' — ' + formatShortDate(range.end) : 'весь месяц'; }
 function formatShortDate(iso){ if(!iso) return '—'; const d=parseISO(iso); return String(d.getDate()).padStart(2,'0')+'.'+String(d.getMonth()+1).padStart(2,'0'); }
 function formatFullDate(iso){ if(!iso) return '—'; const d=parseISO(iso); return formatShortDate(iso)+'.'+d.getFullYear(); }
 function fmtNum(v, dec){
@@ -757,11 +774,17 @@ function computeMetrics(){
 
   const importedSet = new Set((state.imports || []).map(i => i.date).filter(d => allDatesSet.has(d)));
   const salesInRange = (state.sales || []).filter(r => allDatesSet.has(r.date));
+  /* Диапазон продаж каждой SKU: пустые даты = весь месяц, иначе строгий период «с — по» */
+  const skuRanges = {};
+  skuList.forEach(sku => { skuRanges[sku.id] = skuSaleRange(sku, startDate, endDate); });
   const mapped = [];
   let unmappedCount = 0, unmappedQty = 0;
   salesInRange.forEach(r => {
     const skuId = articleMap.get(normArticle(r.article));
-    if (skuId) mapped.push(Object.assign({}, r, { skuId }));
+    if (skuId) {
+      if (isDateInSkuRange(r.date, skuRanges[skuId])) mapped.push(Object.assign({}, r, { skuId }));
+      else { unmappedCount++; unmappedQty += Number(r.qty) || 0; }
+    }
     else { unmappedCount++; unmappedQty += Number(r.qty) || 0; }
   });
 
@@ -788,7 +811,7 @@ function computeMetrics(){
   getActiveSellers().forEach(sel => sellersInfo.set(sel.key, blankSeller(sel.key, sel.name)));
 
   const bySku = {};
-  skuList.forEach(sku => { bySku[sku.id] = { units:0, revenue:0, sellers:{} }; });
+  skuList.forEach(sku => { bySku[sku.id] = { units:0, revenue:0, sellers:{}, byDate:{} }; });
   const byDate = {};
 
   mapped.forEach(r => {
@@ -804,6 +827,7 @@ function computeMetrics(){
     skuData.sellers[key] = skuData.sellers[key] || { units:0, revenue:0 };
     skuData.sellers[key].units += qty;
     skuData.sellers[key].revenue += revenue;
+    skuData.byDate[r.date] = (skuData.byDate[r.date] || 0) + qty;
     byDate[r.date] = (byDate[r.date] || 0) + qty;
     seller.daily[r.date] = (seller.daily[r.date] || 0) + qty;
   });
@@ -825,22 +849,65 @@ function computeMetrics(){
   const storeChecks = explicitStoreChecks > 0 ? explicitStoreChecks : sellerChecksSum;
 
   const skuMetrics = skuList.map((sku, idx) => {
-    const data = bySku[sku.id] || { units:0, revenue:0, sellers:{} };
+    const data = bySku[sku.id] || { units:0, revenue:0, sellers:{}, byDate:{} };
     const units = data.units;
+    const skuByDate = data.byDate || {};
     const plan = Number(sku.planUnits) || 0;
     const cashierRate = Number(sku.cashierRate) || 0;
     const fundRate = Number(sku.fundRate) || 0;
     const threshold = Number(sku.threshold) || 0;
+    /* Период продаж позиции: расчёты, план и статистика — строго по нему (весь месяц, если даты не заданы) */
+    const range = skuRanges[sku.id] || null;
+    const skuDates = range ? eachDate(range.start, range.end) : allDates;
+    const skuTotalDays = skuDates.length;
+    const skuImportedSet = new Set(skuDates.filter(d => importedSet.has(d)));
+    let skuExpectedEnd = today < rangeStartIso(range, startDate) ? null : (today > rangeEndIso(range, endDate) ? rangeEndIso(range, endDate) : addDaysISO(today, -1));
+    if (range && skuExpectedEnd && skuExpectedEnd < range.start) skuExpectedEnd = null;
+    const skuExpectedDates = skuExpectedEnd && skuExpectedEnd >= rangeStartIso(range, startDate) ? eachDate(rangeStartIso(range, startDate), skuExpectedEnd) : [];
+    const skuTodayLoaded = importedSet.has(today) && today >= rangeStartIso(range, startDate) && today <= rangeEndIso(range, endDate);
+    const skuElapsedDays = skuExpectedDates.length + (skuTodayLoaded ? 1 : 0);
+    let skuRemainingStart = null;
+    const skuRangeEnd = rangeEndIso(range, endDate);
+    if (today <= skuRangeEnd) skuRemainingStart = today < rangeStartIso(range, startDate) ? rangeStartIso(range, startDate) : (skuTodayLoaded ? addDaysISO(today, 1) : today);
+    const skuRemainingDates = skuRemainingStart && skuRemainingStart <= skuRangeEnd ? eachDate(skuRemainingStart, skuRangeEnd) : [];
+    const skuRemainingDays = skuRemainingDates.length;
+    const skuMissingDates = skuExpectedDates.filter(d => !importedSet.has(d));
     const achievement = plan > 0 ? (units / plan * 100) : 0;
     const thresholdUnits = plan > 0 ? plan * threshold / 100 : 0;
     const thresholdReached = plan > 0 && units >= thresholdUnits;
     const requiredToPlan = Math.max(0, Math.ceil(plan - units));
     const requiredToThreshold = Math.max(0, Math.ceil(thresholdUnits - units));
-    const perDayToPlan = remainingDays > 0 ? requiredToPlan / remainingDays : requiredToPlan;
-    const perDayToThreshold = remainingDays > 0 ? requiredToThreshold / remainingDays : requiredToThreshold;
+    const perDayToPlan = skuRemainingDays > 0 ? requiredToPlan / skuRemainingDays : requiredToPlan;
+    const perDayToThreshold = skuRemainingDays > 0 ? requiredToThreshold / skuRemainingDays : requiredToThreshold;
+
+    let skuCum = 0;
+    const skuDailySeries = skuDates.map((d, i) => {
+      const imported = skuImportedSet.has(d);
+      const dayUnits = skuByDate[d] || 0;
+      if (imported) skuCum += dayUnits;
+      return {
+        date: d,
+        imported,
+        future: d > today,
+        unitsOrZero: dayUnits,
+        units: imported ? dayUnits : null,
+        cumulative: imported ? round2(skuCum) : null,
+        planCumulative: plan > 0 ? round2(plan * (i + 1) / skuTotalDays) : 0,
+        requiredPerDay: perDayToPlan
+      };
+    });
+    /* Плановый накопительный на каждую дату месяца: до начала периода — 0, после окончания — план целиком */
+    const planCumByDate = {};
+    allDates.forEach(d => {
+      if (!range) { planCumByDate[d] = plan > 0 ? plan * (allDates.indexOf(d) + 1) / allDates.length : 0; return; }
+      if (d < range.start) { planCumByDate[d] = 0; return; }
+      if (d >= range.end) { planCumByDate[d] = plan; return; }
+      const idx = skuDates.indexOf(d);
+      planCumByDate[d] = plan > 0 && skuTotalDays > 0 ? plan * (idx + 1) / skuTotalDays : 0;
+    });
 
     const sellerEntries = Object.entries(data.sellers).map(([key, val]) => {
-      const projUnits = elapsedDays > 0 ? val.units + (val.units / elapsedDays) * remainingDays : val.units;
+      const projUnits = skuElapsedDays > 0 ? val.units + (val.units / skuElapsedDays) * skuRemainingDays : val.units;
       return {
         key,
         name: sellersInfo.has(key) ? sellersInfo.get(key).name : displayNameForKey(key),
@@ -876,6 +943,14 @@ function computeMetrics(){
       color: SKU_COLORS[idx % SKU_COLORS.length],
       name: sku.name,
       articles: sku.articles || [],
+      range,
+      saleRangeText: skuRangeText(range),
+      skuDates,
+      planCumByDate,
+      skuDailySeries,
+      skuElapsedDays,
+      skuRemainingDays,
+      skuMissingDates,
       units,
       revenue: data.revenue,
       plan,
@@ -962,9 +1037,14 @@ function computeMetrics(){
   const payableTotal = round2(sellers.reduce((a,x) => a + x.payable, 0));
   const projectedPayableTotal = round2(sellers.reduce((a,x) => a + x.projPayable, 0));
   const requiredToPlan = Math.max(0, Math.ceil(planUnits - totalUnits));
-  const perDayToPlan = remainingDays > 0 ? requiredToPlan / remainingDays : requiredToPlan;
   const maxDailySellerUnits = Math.max(0, ...sellers.map(x => x.maxDay));
-  const paceUnitsPerDay = elapsedDays > 0 ? totalUnits / elapsedDays : 0;
+  /* Темп и прогноз «нужно в день» считаем по фактическим дням продаж каждой позиции (учитывая периоды «с — по») */
+  const sumRemaining = skuMetrics.reduce((a,x) => a + x.skuRemainingDays, 0);
+  const sumRequired = skuMetrics.reduce((a,x) => a + x.requiredToPlan, 0);
+  const sumElapsed = skuMetrics.reduce((a,x) => a + x.skuElapsedDays, 0);
+  const sumUnitsForPace = skuMetrics.reduce((a,x) => a + x.units, 0);
+  const paceUnitsPerDay = sumElapsed > 0 ? sumUnitsForPace / sumElapsed : 0;
+  const totalsPerDayToPlan = sumRemaining > 0 ? sumRequired / sumRemaining : (sumRequired || 0);
 
   let cum = 0;
   const dailySeries = allDates.map((d, i) => {
@@ -978,8 +1058,8 @@ function computeMetrics(){
       unitsOrZero: units,
       units: imported ? units : null,
       cumulative: imported ? round2(cum) : null,
-      planCumulative: planUnits > 0 ? round2(planUnits * (i + 1) / allDates.length) : 0,
-      requiredPerDay: perDayToPlan
+      planCumulative: planUnits > 0 ? round2(skuMetrics.reduce((a,x) => a + x.planCumByDate[d], 0)) : 0,
+      requiredPerDay: totalsPerDayToPlan
     };
   });
 
@@ -990,7 +1070,7 @@ function computeMetrics(){
     projectedUnits,
     projectedAchievement: planUnits > 0 ? projectedUnits / planUnits * 100 : 0,
     requiredToPlan,
-    perDayToPlan,
+    perDayToPlan: totalsPerDayToPlan,
     paceUnitsPerDay,
     thresholdsReached: skuMetrics.filter(x => x.thresholdReached).length,
     projectedThresholdsReached: skuMetrics.filter(x => x.projectedThresholdReached).length,
@@ -1440,6 +1520,7 @@ function renderOverview(m){
         <div class="sku-head">
           <div>
             ${chip(sku.thresholdReached ? 'Порог ' + fmtNum(sku.threshold,0) + '% взят' : 'Порог ' + fmtNum(sku.threshold,0) + '%', status)}
+            ${sku.range ? chip('Продажи: ' + sku.saleRangeText, 'info') : ''}
             <div class="sku-title">${esc(sku.name)}</div>
             <div class="muted small">${esc(articlesPreview)}</div>
           </div>
@@ -1465,6 +1546,7 @@ function renderOverview(m){
           Кассир: <strong>${fmtNum(sku.cashierRate,2)} ₽/шт</strong> •
           Фонд: <strong>${fmtNum(sku.fundRate,2)} ₽/шт</strong> •
           Прогноз выплат: <strong>${fmtMoney(payoutProj)}</strong>
+          ${sku.range ? `<br>Период продаж: <strong>${esc(sku.saleRangeText)}</strong> • расчёты и план — только по этим дням (${sku.skuDates.length} дн.)` : ''}
           ${sku.targetPenetration != null ? `<br>Целевая пенетрация-оценка: <strong>${fmtPct(sku.targetPenetration,2)}</strong>` : ''}
         </div>
       </div>
@@ -1965,8 +2047,13 @@ function renderDayDayCharts(m){
     const datasets = skuList.map((sku, idx) => ({
       label: sku.name,
       data: m.dailySeries.map(d => {
-        const dayData = m.byDate[d.date] || 0;
-        return dayData > 0 ? round2((sku.units / m.totals.units) * dayData) : 0;
+        const totalForDay = m.byDate[d.date] || 0;
+        if (totalForDay === 0) return 0;
+        /* Реальное количество SKU за день (в т.ч. с учётом периода «с — по»); пропорция — как раньше */
+        const actualSkuDay = sku.skuDailySeries.reduce((a, x) => x.date === d.date ? a + x.unitsOrZero : a, 0);
+        const otherActual = skuList.reduce((a, x) => a + x.skuDailySeries.reduce((b, y) => y.date === d.date ? b + y.unitsOrZero : b, 0), 0);
+        const share = otherActual > 0 ? actualSkuDay / otherActual : 1 / skuList.length;
+        return round2(totalForDay * share);
       }),
       backgroundColor: sku.color,
       borderColor: sku.color,
@@ -2006,7 +2093,11 @@ function renderDayDayCharts(m){
       data: m.dailySeries.map(d => {
         const totalForDay = m.byDate[d.date] || 0;
         if (totalForDay === 0) return 0;
-        return round2((sku.units / m.totals.units) * totalForDay);
+        /* Реальное количество SKU за день (в т.ч. с учётом периода «с — по»); пропорция — как раньше */
+        const actualSkuDay = sku.skuDailySeries.reduce((a, x) => x.date === d.date ? a + x.unitsOrZero : a, 0);
+        const otherActual = skuList.reduce((a, x) => a + x.skuDailySeries.reduce((b, y) => y.date === d.date ? b + y.unitsOrZero : b, 0), 0);
+        const share = otherActual > 0 ? actualSkuDay / otherActual : 1 / skuList.length;
+        return round2(totalForDay * share);
       }),
       backgroundColor: sku.color,
       borderWidth: 0
@@ -2277,7 +2368,10 @@ function renderSettings(){
             <div class="field"><label>Кассиру, ₽/шт</label><input class="input" type="number" min="0" step="0.01" data-sku-index="${i}" data-sku-field="cashierRate" value="${esc(sku.cashierRate)}"></div>
             <div class="field"><label>Фонд, ₽/шт</label><input class="input" type="number" min="0" step="0.01" data-sku-index="${i}" data-sku-field="fundRate" value="${esc(sku.fundRate)}"></div>
             <div class="field"><label>Порог фонда, %</label><input class="input" type="number" min="0" max="100" step="1" data-sku-index="${i}" data-sku-field="threshold" value="${esc(sku.threshold)}"></div>
+            <div class="field"><label>Продажи с даты (пусто = со начала месяца)</label><input class="input" type="date" data-sku-index="${i}" data-sku-field="startDate" value="${esc(sku.startDate || '')}" min="${esc(d.startDate)}" max="${esc(d.endDate)}"></div>
+            <div class="field"><label>Продажи по дату (пусто = до конца месяца)</label><input class="input" type="date" data-sku-index="${i}" data-sku-field="endDate" value="${esc(sku.endDate || '')}" min="${esc(d.startDate)}" max="${esc(d.endDate)}"></div>
           </div>
+          <div class="note">Если даты не указаны — позиция продаётся и рассчитывается весь месяц. Укажите конкретные даты, чтобы план, расчёты и статистика считались строго по этому периоду.</div>
           <div class="field"><label>Артикулы (по одному в строке или через запятую)</label><textarea data-sku-index="${i}" data-sku-field="articlesText">${esc(sku.articlesText || '')}</textarea></div>
         </div>
       `).join('') : '<div class="editor-card muted">Позиций нет. Добавьте первую товарную позицию.</div>'}
@@ -2330,8 +2424,16 @@ function saveSettings(){
     cashierRate: Number(sku.cashierRate) || 0,
     fundRate: Number(sku.fundRate) || 0,
     threshold: Math.max(0, Math.min(100, Number(sku.threshold) || 0)),
+    startDate: typeof sku.startDate === 'string' ? sku.startDate : '',
+    endDate: typeof sku.endDate === 'string' ? sku.endDate : '',
     enabled: sku.enabled !== false
   })).filter(sku => sku.name);
+  /* Период активности позиции: даты необязательны (пусто = весь месяц), но не должны противоречить друг другу */
+  const badSkuRange = settingsDraft.skus.some(sku => sku.startDate && sku.endDate && sku.startDate > sku.endDate);
+  if (badSkuRange) {
+    showToast('Проверьте даты продаж товарной позиции: «с» позже «по»', 'error');
+    return;
+  }
 
   state.settings = JSON.parse(JSON.stringify(settingsDraft));
   settingsDraft = null;
