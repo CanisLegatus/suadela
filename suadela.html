@@ -2368,7 +2368,10 @@ function renderSettings(){
             <div class="field"><label>Кассиру, ₽/шт</label><input class="input" type="number" min="0" step="0.01" data-sku-index="${i}" data-sku-field="cashierRate" value="${esc(sku.cashierRate)}"></div>
             <div class="field"><label>Фонд, ₽/шт</label><input class="input" type="number" min="0" step="0.01" data-sku-index="${i}" data-sku-field="fundRate" value="${esc(sku.fundRate)}"></div>
             <div class="field"><label>Порог фонда, %</label><input class="input" type="number" min="0" max="100" step="1" data-sku-index="${i}" data-sku-field="threshold" value="${esc(sku.threshold)}"></div>
+            <div class="field"><label>Продажи с даты (пусто = со начала месяца)</label><input class="input" type="date" data-sku-index="${i}" data-sku-field="startDate" value="${esc(sku.startDate || '')}" min="${esc(d.startDate)}" max="${esc(d.endDate)}"></div>
+            <div class="field"><label>Продажи по дату (пусто = до конца месяца)</label><input class="input" type="date" data-sku-index="${i}" data-sku-field="endDate" value="${esc(sku.endDate || '')}" min="${esc(d.startDate)}" max="${esc(d.endDate)}"></div>
           </div>
+          <div class="note">Если даты не указаны — позиция продаётся и рассчитывается весь месяц. Укажите конкретные даты, чтобы план, расчёты и статистика считались строго по этому периоду.</div>
           <div class="field"><label>Артикулы (по одному в строке или через запятую)</label><textarea data-sku-index="${i}" data-sku-field="articlesText">${esc(sku.articlesText || '')}</textarea></div>
         </div>
       `).join('') : '<div class="editor-card muted">Позиций нет. Добавьте первую товарную позицию.</div>'}
@@ -2421,8 +2424,16 @@ function saveSettings(){
     cashierRate: Number(sku.cashierRate) || 0,
     fundRate: Number(sku.fundRate) || 0,
     threshold: Math.max(0, Math.min(100, Number(sku.threshold) || 0)),
+    startDate: typeof sku.startDate === 'string' ? sku.startDate : '',
+    endDate: typeof sku.endDate === 'string' ? sku.endDate : '',
     enabled: sku.enabled !== false
   })).filter(sku => sku.name);
+  /* Период активности позиции: даты необязательны (пусто = весь месяц), но не должны противоречить друг другу */
+  const badSkuRange = settingsDraft.skus.some(sku => sku.startDate && sku.endDate && sku.startDate > sku.endDate);
+  if (badSkuRange) {
+    showToast('Проверьте даты продаж товарной позиции: «с» позже «по»', 'error');
+    return;
+  }
 
   state.settings = JSON.parse(JSON.stringify(settingsDraft));
   settingsDraft = null;
